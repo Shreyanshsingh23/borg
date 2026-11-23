@@ -202,6 +202,13 @@ class KeysMixIn:
         process in which each line is checked for plausibility before
         proceeding to the next line. For this format PATH must not be given.
 
+        Before storing anything, the imported borg key is checked: it must be a
+        well-formed borg key, it must unlock with its passphrase and it must belong
+        to this repository. The passphrase is taken from ``BORG_PASSPHRASE`` (or
+        ``BORG_PASSCOMMAND``, ``BORG_PASSPHRASE_FD``) or asked for interactively.
+        If any check fails, nothing is stored and the existing borg keys stay as
+        they are. A wrong passphrase and a damaged key backup can not be told apart.
+
         Where the imported key is stored is decided by ``--key-location``:
 
         - ``repokey`` (the default): the key is stored **in the repository**, no local

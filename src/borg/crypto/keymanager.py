@@ -4,11 +4,18 @@ import pkgutil
 import textwrap
 from hashlib import sha256
 
+from ..constants import KEY_ALGORITHMS
 from ..helpers import Error, CommandError, yes, bin_to_hex, hex_to_bin, dash_open, get_keys_dir
+from ..helpers import get_limited_unpacker, msgpack
+from ..helpers.passphrase import Passphrase, PassphraseWrong, PasswordRetriesExceeded
+from ..item import EncryptedKey
+from ..logger import create_logger
 
 
-from .key import keyfile_format, keyfile_parse, is_keyfile
+from .key import keyfile_format, keyfile_parse, is_keyfile, KeyfileInvalidError, KeyfileMismatchError
 from .key import RepoKeyNotFoundError, KeyBlobStorage, KEY_LOCATIONS, key_class_of, keyfile_name_for
+
+logger = create_logger()
 
 
 class NotABorgKeyFile(Error):
@@ -116,6 +123,62 @@ class KeyManager:
             key_data = keyfile_format(bin_to_hex(self.repository.id), self.keyblob.strip())
             self.repository.save_key(key_data.encode("utf-8"))
 
+    def check_keyblob(self, source):
+        """Check that self.keyblob is a well-formed borg key, so a corrupted key backup is not imported.
+
+        This needs no passphrase: it checks the base64 encoding and the (unencrypted) EncryptedKey envelope
+        around the encrypted key material. That catches truncated or garbled key backups before asking for
+        a passphrase. Damage inside the encrypted key material is detected by unlock_keyblob.
+        """
+        try:
+            data = binascii.a2b_base64(self.keyblob)
+            unpacker = get_limited_unpacker("key")
+            unpacker.feed(data)
+            envelope = EncryptedKey(internal_dict=unpacker.unpack())
+            # access everything FlexiKey.decrypt_key_file needs, a missing value raises AttributeError.
+            valid = (
+                unpacker.tell() == len(data)  # nothing after the envelope
+                and envelope.version == 1
+                and envelope.algorithm == KEY_ALGORITHMS["argon2"]
+                and len(envelope.salt) > 0
+                and len(envelope.data) > 0
+                and envelope.argon2_time_cost > 0
+                and envelope.argon2_memory_cost > 0
+                and envelope.argon2_parallelism > 0
+                and envelope.argon2_type in ("i", "d", "id")
+            )
+        except (ValueError, TypeError, AttributeError, AssertionError, msgpack.OutOfData, msgpack.UnpackException):
+            # AssertionError: PropDict asserts that the envelope keys are str.
+            valid = False
+        if not valid:
+            raise KeyfileInvalidError(self.repository._location.canonical_path(), source)
+
+    def unlock_keyblob(self, source):
+        """Unlock self.keyblob with its passphrase and check that the borg key belongs to this repository.
+
+        The encrypted key material is authenticated, so this also detects damage inside it. A wrong
+        passphrase and damaged key material can not be told apart, both fail to unlock the borg key.
+        """
+        key = self.key_cls(self.repository)
+        passphrase = Passphrase.env_passphrase()
+        if passphrase is not None:
+            if not key._load(self.keyblob, passphrase):
+                logger.warning("Could not unlock the borg key in %s: wrong passphrase or damaged key backup.", source)
+                Passphrase.display_debug_info(passphrase)
+                raise PassphraseWrong
+        elif not key._load(self.keyblob, Passphrase()):  # same as FlexiKey.detect: try an empty passphrase first
+            prompt = "Enter passphrase for the borg key in %s: " % source
+            for retry in range(3):
+                passphrase = Passphrase.getpass(prompt)
+                if key._load(self.keyblob, passphrase):
+                    break
+                Passphrase.display_debug_info(passphrase)
+            else:
+                logger.warning("Could not unlock the borg key in %s: wrong passphrase or damaged key backup.", source)
+                raise PasswordRetriesExceeded
+        if key.repository_id != self.repository.id:
+            raise KeyfileMismatchError(self.repository._location.canonical_path(), source)
+
     def get_keyfile_data(self):
         return keyfile_format(bin_to_hex(self.repository.id), self.keyblob.strip())
 
@@ -187,6 +250,9 @@ class KeyManager:
                 raise NotABorgKeyFile() from None
             raise RepoIdMismatch() from None
         self.keyblob = b64data
+        source = "(stdin)" if args.path == "-" else args.path
+        self.check_keyblob(source)
+        self.unlock_keyblob(source)
         self.store_keyblob(args)
 
     def import_paperkey(self, args):
@@ -261,6 +327,12 @@ class KeyManager:
                     continue
 
                 self.keyblob = "\n".join(textwrap.wrap(binascii.b2a_base64(result).decode("ascii"))) + "\n"
+                try:
+                    self.check_keyblob("(paper key)")
+                except KeyfileInvalidError:
+                    print("The typed key is not a valid borg key, retry or enter a blank line to abort.")
+                    continue
+                self.unlock_keyblob("(paper key)")
                 self.store_keyblob(args)
                 break
 

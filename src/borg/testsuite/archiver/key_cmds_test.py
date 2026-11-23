@@ -1,5 +1,6 @@
 import binascii
 import os
+from unittest import mock
 
 import pytest
 
@@ -7,9 +8,10 @@ from ...crypto.key import store_hash
 from ...constants import *  # NOQA
 from ...constants import KeyBlobStorage
 from ...crypto.key import AESOCBKey, CHPOKey, Passphrase, is_keyfile, keyfile_parse
-from ...crypto.key import RepoKeyNotFoundError
+from ...crypto.key import KeyfileInvalidError, KeyfileMismatchError, RepoKeyNotFoundError
 from ...crypto.keymanager import RepoIdMismatch, NotABorgKeyFile
 from ...helpers import CommandError
+from ...helpers.passphrase import PassphraseWrong, PasswordRetriesExceeded
 from ...helpers import bin_to_hex, hex_to_bin
 from ...helpers import msgpack
 from ...repository import Repository
@@ -300,6 +302,150 @@ def test_key_import_errors(archivers, request):
             cmd(archiver, "key", "import", export_file)
 
 
+@pytest.mark.parametrize("key_location", ["repokey", "keyfile"])
+def test_key_import_corrupted_keeps_existing_key(archivers, request, key_location):
+    archiver = request.getfixturevalue(archivers)
+    export_file = archiver.output_path + "/exported"
+    corrupted_file = archiver.output_path + "/corrupted"
+    cmd(archiver, "repo-create", RK_ENCRYPTION, f"--key-location={key_location}")
+    cmd(archiver, "key", "export", export_file)
+    with open(export_file) as fd:
+        export_contents = fd.read()
+    header, b64data = export_contents.split("\n", 1)
+
+    def list_keys():
+        return [line.split()[-4:] for line in cmd(archiver, "key", "list").splitlines()[1:]]
+
+    keys_before = list_keys()
+    keyfiles_before = sorted(os.listdir(archiver.keys_path))
+
+    for corrupted_b64 in (
+        "garbage\n",  # not base64
+        b64data[: len(b64data) // 2] + "\n",  # truncated
+        binascii.b2a_base64(os.urandom(300)).decode(),  # base64, but not a borg key
+        binascii.b2a_base64(msgpack.packb({"version": 1})).decode(),  # incomplete key envelope
+        binascii.b2a_base64(binascii.a2b_base64(b64data) + b"\x00").decode(),  # data after the key envelope
+    ):
+        with open(corrupted_file, "w") as fd:
+            fd.write(header + "\n" + corrupted_b64)
+        if archiver.FORK_DEFAULT:
+            expected_ec = KeyfileInvalidError().exit_code
+            cmd(archiver, "key", "import", corrupted_file, f"--key-location={key_location}", exit_code=expected_ec)
+        else:
+            with pytest.raises(KeyfileInvalidError):
+                cmd(archiver, "key", "import", corrupted_file, f"--key-location={key_location}")
+
+    # nothing was stored or overwritten, the repository is still usable with the existing borg key:
+    assert sorted(os.listdir(archiver.keys_path)) == keyfiles_before
+    assert list_keys() == keys_before
+    cmd(archiver, "repo-list")
+
+
+def _import_expecting(archiver, error, *args, **kw):
+    if archiver.FORK_DEFAULT:
+        cmd(archiver, "key", "import", *args, exit_code=error().exit_code, **kw)
+    else:
+        with pytest.raises(error):
+            cmd(archiver, "key", "import", *args, **kw)
+
+
+@pytest.mark.parametrize("key_location", ["repokey", "keyfile"])
+def test_key_import_damaged_or_locked_key_keeps_existing_key(archivers, request, monkeypatch, key_location):
+    archiver = request.getfixturevalue(archivers)
+    export_file = archiver.output_path + "/exported"
+    damaged_file = archiver.output_path + "/damaged"
+    cmd(archiver, "repo-create", RK_ENCRYPTION, f"--key-location={key_location}")
+    cmd(archiver, "key", "export", export_file)
+    with open(export_file) as fd:
+        header, b64data = fd.read().split("\n", 1)
+    keys_before = cmd(archiver, "key", "list")
+    keyfiles_before = sorted(os.listdir(archiver.keys_path))
+
+    # a well-formed borg key with damaged encrypted key material (the last bytes are in the envelope's data):
+    data = bytearray(binascii.a2b_base64(b64data))
+    data[-20] ^= 1
+    with open(damaged_file, "w") as fd:
+        fd.write(header + "\n" + binascii.b2a_base64(bytes(data)).decode())
+    _import_expecting(archiver, PassphraseWrong, damaged_file, f"--key-location={key_location}")
+
+    # an intact borg key, but the wrong passphrase:
+    with monkeypatch.context() as m:
+        m.setenv("BORG_PASSPHRASE", "not the passphrase")
+        _import_expecting(archiver, PassphraseWrong, export_file, f"--key-location={key_location}")
+
+    assert sorted(os.listdir(archiver.keys_path)) == keyfiles_before
+    assert cmd(archiver, "key", "list") == keys_before
+    cmd(archiver, "repo-list")
+
+
+def test_key_import_key_of_other_repository(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    export_file = archiver.output_path + "/exported"
+    cmd(archiver, "repo-create", KF_ENCRYPTION, KF_LOCATION)
+    cmd(archiver, "key", "export", export_file)
+    keyfiles_before = sorted(os.listdir(archiver.keys_path))
+    # the repository gets another id, and the BORG_KEY header of the key backup is changed to match it,
+    # but the borg key itself still belongs to the old repository id:
+    new_id = _set_repository_id(archiver.repository_path, os.urandom(32))
+    with open(export_file) as fd:
+        b64data = fd.read().split("\n", 1)[1]
+    with open(export_file, "w") as fd:
+        fd.write(f"BORG_KEY {bin_to_hex(new_id)}\n" + b64data)
+    _import_expecting(archiver, KeyfileMismatchError, export_file, "--key-location=keyfile")
+    assert sorted(os.listdir(archiver.keys_path)) == keyfiles_before
+
+
+def test_key_import_asks_for_passphrase(archivers, request, monkeypatch):
+    archiver = request.getfixturevalue(archivers)
+    if archiver.FORK_DEFAULT:
+        pytest.skip("getpass can only be mocked in-process")
+    export_file = archiver.output_path + "/exported"
+    cmd(archiver, "repo-create", RK_ENCRYPTION)
+    cmd(archiver, "key", "export", export_file)
+    passphrase = os.environ["BORG_PASSPHRASE"]
+    monkeypatch.delenv("BORG_PASSPHRASE")
+    monkeypatch.setenv("BORG_DISPLAY_PASSPHRASE", "no")
+
+    with mock.patch("getpass.getpass", return_value="wrong") as getpass:
+        with pytest.raises(PasswordRetriesExceeded):
+            cmd(archiver, "key", "import", export_file)
+    assert getpass.call_count == 3
+
+    with mock.patch("getpass.getpass", side_effect=["wrong", passphrase]) as getpass:
+        cmd(archiver, "key", "import", export_file)
+    assert getpass.call_count == 2
+    assert "Enter passphrase for the borg key in" in getpass.call_args.args[0]
+
+
+def test_key_import_paperkey_with_retries(archivers, request):
+    archiver = request.getfixturevalue(archivers)
+    export_file = archiver.output_path + "/exported"
+    cmd(archiver, "repo-create", KF_ENCRYPTION, KF_LOCATION)
+    cmd(archiver, "key", "export", "--paper", export_file)
+    key_file = os.path.join(archiver.keys_path, os.listdir(archiver.keys_path)[0])
+    with open(key_file) as fd:
+        key_contents = fd.read()
+    os.unlink(key_file)
+
+    with open(export_file) as fd:
+        lines = fd.read().splitlines()
+    # type the id line and the data lines, without the "id: " and " 1: " prefixes:
+    typed_lines = [line.split(": ", 1)[1] for line in lines if ": " in line]
+
+    def bad_checksum(line):
+        data, checksum = line.rsplit("- ", 1)
+        return data + "- " + ("00" if checksum != "00" else "01")
+
+    # first some typos (which borg asks to retype), then the correct lines:
+    typed_lines = [bad_checksum(typed_lines[0]), typed_lines[0], bad_checksum(typed_lines[1])] + typed_lines[1:]
+    typed_input = ("\n".join(typed_lines) + "\n").encode()
+    cmd(archiver, "key", "import", "--paper", "--key-location=keyfile", input=typed_input)
+
+    with open(os.path.join(archiver.keys_path, os.listdir(archiver.keys_path)[0])) as fd:
+        assert fd.read() == key_contents
+    cmd(archiver, "repo-list")
+
+
 def test_key_export_paperkey(archivers, request):
     archiver = request.getfixturevalue(archivers)
     repo_id = "e294423506da4e1ea76e8dcdf1a3919624ae3ae496fddf905610c351d3f09239"
@@ -366,7 +512,15 @@ def test_key_import_paperkey(archivers, request):
     #         print(i.to_bytes(2, 'big'))
     #         break
 
-    cmd(archiver, "key", "import", "--paper", input=typed_input)
+    # the typed input is correct in the end, but the key data in it is not a borg key, so it is not stored
+    # and borg asks again (the input ends there, which aborts the import):
+    output = cmd(archiver, "key", "import", "--paper", input=typed_input)
+    assert "The typed key is not a valid borg key" in output
+    with open(key_file) as fd:
+        assert (
+            fd.read()
+            == AESOCBKey.FILE_ID + " " + repo_id + "\n" + binascii.b2a_base64(b"abcdefghijklmnopqrstu").decode()
+        )
 
     # Test abort paths
     typed_input = b"\ny\n"
@@ -417,7 +571,6 @@ def test_change_location_does_not_change_algorithm_argon2(archivers, request):
 
 from ...constants import EXIT_ERROR  # noqa: E402
 from ...helpers import Error  # noqa: E402
-from ...helpers.passphrase import PassphraseWrong  # noqa: E402
 
 DEFAULT_PASSPHRASE = "waytooeasyonlyfortests"  # see set_env_variables fixture in conftest
 
